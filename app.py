@@ -15,20 +15,19 @@ try:
 except Exception:
     XGB_OK = False
 
-# Check for sklearn
+# ML imports check
 try:
-    from sklearn.ensemble import GradientBoostingClassifier
     SKLEARN_OK = True
 except Exception:
     SKLEARN_OK = False
 
-# Initialize session state
+# Session state initialization
 if "analysis_run" not in st.session_state:
     st.session_state.analysis_run = False
 
 # ---------------- CONFIG ----------------
-st.set_page_config(page_title="Nifty500 Weekly Predictor - Gradient Boosting", layout="wide")
-st.title("📊 Nifty500 Predictor (Weekly) — Gradient Boosting + Elliott Wave")
+st.set_page_config(page_title="Nifty500 Weekly Buy/Sell Predictor", layout="wide")
+st.title("📊 Nifty500 Buy/Sell Predictor (Weekly) — Rules + Elliott Wave + GB ML")
 
 # ---------------- TICKERS ----------------
 NIFTY500_TICKERS = [
@@ -86,6 +85,14 @@ NIFTY500_TICKERS = [
 ]
 
 # ---------------- UTIL ----------------
+def add_tradingview_links(df):
+    df = df.copy()
+    if "Ticker" in df.columns:
+        df["TradingView"] = df["Ticker"].apply(
+            lambda t: f'<a href="https://www.tradingview.com/chart/?symbol=NSE:{t.replace(".NS","")}" target="_blank">📈 Chart</a>'
+        )
+    return df
+
 class _TQDM:
     def __init__(self, total, desc=""):
         self.pb = st.progress(0, text=desc)
@@ -133,66 +140,181 @@ def load_history_for_ticker(ticker, period="5y", interval="1wk"):
         return df
     except: return pd.DataFrame()
 
-# ---------------- ELLIOTT WAVE & FEATURES ----------------
+# ---------------- ELLIOTT WAVE (ZigZag + Heuristics) ----------------
 def zigzag_pivots(close: pd.Series, pct=0.05, min_bars=5):
-    if close.isna().all() or len(close) < 50: return pd.DataFrame()
+    if close.isna().all() or len(close) < max(50, min_bars * 4):
+        return pd.DataFrame(columns=["idx", "price", "type"])
     c = close.values.astype(float)
     idxs = close.index
     piv = []
-    last_piv_i, last_piv_p, trend = 0, c[0], None
-    last_extreme_i, last_extreme_p = 0, c[0]
-
+    last_piv_i, last_extreme_i, trend = 0, 0, None
+    last_extreme_p = c[0]
     for i in range(1, len(c)):
         if trend in (None, "up"):
             if c[i] > last_extreme_p: last_extreme_p, last_extreme_i = c[i], i
         if trend in (None, "down"):
             if c[i] < last_extreme_p: last_extreme_p, last_extreme_i = c[i], i
-        
-        if trend in (None, "up") and last_extreme_p != 0:
-            if (c[i] - last_extreme_p) / last_extreme_p <= -pct and (i - last_piv_i) >= min_bars:
+        if trend in (None, "up"):
+            dd = (c[i] - last_extreme_p) / last_extreme_p if last_extreme_p != 0 else 0
+            if dd <= -pct and (i - last_piv_i) >= min_bars:
                 piv.append((idxs[last_extreme_i], float(last_extreme_p), "H"))
                 last_piv_i, trend = last_extreme_i, "down"
                 last_extreme_p, last_extreme_i = c[i], i
-        elif trend in (None, "down") and last_extreme_p != 0:
-            if (c[i] - last_extreme_p) / last_extreme_p >= pct and (i - last_piv_i) >= min_bars:
+        if trend in (None, "down"):
+            uu = (c[i] - last_extreme_p) / last_extreme_p if last_extreme_p != 0 else 0
+            if uu >= pct and (i - last_piv_i) >= min_bars:
                 piv.append((idxs[last_extreme_i], float(last_extreme_p), "L"))
                 last_piv_i, trend = last_extreme_i, "up"
                 last_extreme_p, last_extreme_i = c[i], i
-    return pd.DataFrame(piv, columns=["idx", "price", "type"]) if piv else pd.DataFrame()
+    if len(piv) >= 2:
+        cleaned = [piv[0]]
+        for i in range(1, len(piv)):
+            if piv[i][2] == cleaned[-1][2]:
+                if (piv[i][2] == "H" and piv[i][1] > cleaned[-1][1]) or (piv[i][2] == "L" and piv[i][1] < cleaned[-1][1]):
+                    cleaned[-1] = piv[i]
+            else: cleaned.append(piv[i])
+        piv = cleaned
+    if not piv: return pd.DataFrame(columns=["idx", "price", "type"])
+    idx, price, typ = zip(*piv)
+    return pd.DataFrame({"idx": list(idx), "price": list(price), "type": list(typ)})
+
+def fib_okay(a, b, ratio, tol=0.18):
+    if b == 0 or np.isnan(a) or np.isnan(b): return False
+    return abs((a / b) - ratio) <= tol * ratio
 
 def elliott_phase_from_pivots(pivots: pd.DataFrame):
     out = {"phase": "Unknown", "wave_no": 0, "bullish": False, "bearish": False}
-    if len(pivots) < 3: return out
-    p3 = pivots.iloc[-3:]
-    types = p3["type"].tolist()
-    if types == ["L", "H", "L"]: out.update({"phase": "CorrectionUp", "wave_no": 3, "bullish": True})
-    elif types == ["H", "L", "H"]: out.update({"phase": "CorrectionDown", "wave_no": 3, "bearish": True})
+    if pivots.empty: return out
+    if len(pivots) >= 5:
+        p5 = pivots.iloc[-5:].reset_index(drop=True)
+        if all(p5.loc[i, "type"] != p5.loc[i-1, "type"] for i in range(1, 5)):
+            prices, types = p5["price"].values, p5["type"].values
+            if types.tolist() == ["L", "H", "L", "H", "L"]:
+                if prices[3] > prices[1] and prices[4] > prices[2]:
+                    out.update({"phase": "ImpulseUp", "wave_no": 5, "bullish": True})
+                    return out
+            if types.tolist() == ["H", "L", "H", "L", "H"]:
+                if prices[3] < prices[1] and prices[4] < prices[2]:
+                    out.update({"phase": "ImpulseDown", "wave_no": 5, "bearish": True})
+                    return out
+    if len(pivots) >= 3:
+        p3 = pivots.iloc[-3:].reset_index(drop=True)
+        if all(p3.loc[i, "type"] != p3.loc[i-1, "type"] for i in range(1, 3)):
+            t = p3["type"].tolist()
+            if t == ["L", "H", "L"]: out.update({"phase": "CorrectionUp", "wave_no": 3, "bullish": True})
+            elif t == ["H", "L", "H"]: out.update({"phase": "CorrectionDown", "wave_no": 3, "bearish": True})
     return out
 
+def add_elliott_features_core(df_close: pd.Series, pct=0.05, min_bars=5):
+    piv = zigzag_pivots(df_close, pct=pct, min_bars=min_bars)
+    phase = elliott_phase_from_pivots(piv)
+    return phase, piv
+
+# ---------------- FEATURE ENGINEERING ----------------
 def compute_features(df, sma_windows=(20, 50, 200), support_window=30, zz_pct=0.05, zz_min_bars=5):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
     if "Close" not in df.columns or df["Close"].dropna().empty: return pd.DataFrame()
-    
     df = df.copy()
-    df["RSI"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
-    for win in sma_windows: df[f"SMA{win}"] = df["Close"].rolling(window=win).mean()
-    df["Support"] = df["Close"].rolling(window=support_window).min()
-    
-    # Elliott
-    piv = zigzag_pivots(df["Close"], pct=zz_pct, min_bars=zz_min_bars)
-    phase = elliott_phase_from_pivots(piv)
-    phase_map = {"ImpulseUp": 1, "ImpulseDown": -1, "CorrectionUp": 2, "CorrectionDown": -2, "Unknown": 0}
-    df["Elliott_Phase_Code"] = phase_map.get(phase["phase"], 0)
-    df["Elliott_Bullish_Int"] = int(phase["bullish"])
-    df["Elliott_Bearish_Int"] = int(phase["bearish"])
-    
-    # Returns/Distances
-    for w in (1, 5): df[f"Ret_{w}"] = df["Close"].pct_change(w)
+    try: df["RSI"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
+    except: df["RSI"] = np.nan
+    for win in sma_windows: df[f"SMA{win}"] = df["Close"].rolling(window=win, min_periods=1).mean()
+    df["Support"] = df["Close"].rolling(window=support_window, min_periods=1).min()
+    df["RSI_Direction"] = df["RSI"].diff(5)
+    df["Price_Direction"] = df["Close"].diff(5)
+    df["Bullish_Div"] = (df["RSI_Direction"] > 0) & (df["Price_Direction"] < 0)
+    df["Bearish_Div"] = (df["RSI_Direction"] < 0) & (df["Price_Direction"] > 0)
+    for w in (1, 3, 5, 10): df[f"Ret_{w}"] = df["Close"].pct_change(w)
     for win in sma_windows: df[f"Dist_SMA{win}"] = (df["Close"] - df[f"SMA{win}"]) / df[f"SMA{win}"]
+    for col in ["RSI"] + [f"SMA{w}" for w in sma_windows]: df[f"{col}_slope"] = df[col].diff()
+    try:
+        phase, piv = add_elliott_features_core(df["Close"], pct=zz_pct, min_bars=zz_min_bars)
+        p_map = {"ImpulseUp":1, "ImpulseDown":-1, "CorrectionUp":2, "CorrectionDown":-2, "Unknown":0}
+        df["Elliott_Phase_Code"] = p_map.get(phase["phase"], 0)
+        df["Elliott_Wave_No"] = int(phase.get("wave_no", 0))
+        df["Elliott_Bullish_Int"] = int(phase.get("bullish", False))
+        df["Elliott_Bearish_Int"] = int(phase.get("bearish", False))
+    except:
+        df["Elliott_Phase_Code"] = 0
+        df["Elliott_Wave_No"] = 0
+        df["Elliott_Bullish_Int"] = 0
+        df["Elliott_Bearish_Int"] = 0
     return df
 
-# ---------------- ML ENGINE (GRADIENT BOOSTING) ----------------
+def get_latest_features_for_ticker(ticker_df, ticker, sma_windows, support_window, zz_pct, zz_min_bars):
+    df = compute_features(ticker_df, sma_windows, support_window, zz_pct, zz_min_bars).dropna()
+    if df.empty: return None
+    latest = df.iloc[-1]
+    return {
+        "Ticker": ticker, "Close": float(latest["Close"]), "RSI": float(latest["RSI"]), "Support": float(latest["Support"]),
+        **{f"SMA{w}": float(latest.get(f"SMA{w}", np.nan)) for w in sma_windows},
+        "Bullish_Div": bool(latest["Bullish_Div"]), "Bearish_Div": bool(latest["Bearish_Div"]),
+        "Elliott_Phase_Code": int(latest.get("Elliott_Phase_Code", 0)),
+        "Elliott_Wave_No": int(latest.get("Elliott_Wave_No", 0)),
+        "Elliott_Bullish_Int": int(latest.get("Elliott_Bullish_Int", 0)),
+        "Elliott_Bearish_Int": int(latest.get("Elliott_Bearish_Int", 0)),
+    }
+
+def get_features_for_all(tickers, sma_windows, support_window, zz_pct, zz_min_bars):
+    multi_df = download_data_multi(tickers)
+    if multi_df is None or multi_df.empty: return pd.DataFrame()
+    features_list = []
+    available = multi_df.columns.get_level_values(0).unique() if isinstance(multi_df.columns, pd.MultiIndex) else [tickers[0]]
+    for ticker in tickers:
+        tdf = multi_df[ticker].dropna() if isinstance(multi_df.columns, pd.MultiIndex) else multi_df.dropna()
+        if tdf.empty: continue
+        feats = get_latest_features_for_ticker(tdf, ticker, sma_windows, support_window, zz_pct, zz_min_bars)
+        if feats: features_list.append(feats)
+    return pd.DataFrame(features_list)
+
+# ---------------- STRATEGY & LABELING ----------------
+def predict_buy_sell_rule(df, rsi_buy=30, rsi_sell=70):
+    if df.empty: return df
+    results = df.copy()
+    reversal_buy = (results["RSI"] < rsi_buy) & (results.get("Bullish_Div", True)) & (results["Close"] > results["SMA20"])
+    trend_buy = (results["Close"] > results["SMA20"]) & (results["SMA20"] > results["SMA50"]) & (results["RSI"] > 40)
+    base_sell = ((results["RSI"] > rsi_sell) & (results.get("Bearish_Div", True))) | (results["Close"] < results.get("Support", results["Close"]))
+    ew_bull = (results.get("Elliott_Bullish_Int", 0) == 1) | (results.get("Elliott_Phase_Code", 0) == 1)
+    ew_bear = (results.get("Elliott_Bearish_Int", 0) == 1) | (results.get("Elliott_Phase_Code", 0) == -1)
+    results["Reversal_Buy"] = reversal_buy | ew_bull
+    results["Trend_Buy"] = trend_buy | ew_bull
+    results["Sell_Point"] = results["Reversal_Buy"] | results["Trend_Buy"]
+    results["Buy_Point"] = base_sell | ew_bear
+    return results
+
+def label_from_rule_based(df, rsi_buy=30, rsi_sell=70):
+    rules = predict_buy_sell_rule(df, rsi_buy=rsi_buy, rsi_sell=rsi_sell)
+    label = pd.Series(0, index=rules.index, dtype=int)
+    label[rules["Buy_Point"]] = 1
+    label[rules["Sell_Point"]] = -1
+    return label
+
+def label_from_future_returns(df, horizon=8, buy_thr=0.05, sell_thr=-0.05):
+    fut_ret = df["Close"].shift(-horizon) / df["Close"] - 1.0
+    label = pd.Series(0, index=df.index, dtype=int)
+    label[fut_ret >= buy_thr] = 1
+    label[fut_ret <= sell_thr] = -1
+    return label
+
+# ---------------- ML DATASET & TRAINING ----------------
+def build_ml_dataset_for_tickers(tickers, sma_windows, support_window, label_mode="rule", horizon=8, buy_thr=0.05, sell_thr=-0.05, rsi_buy=30, rsi_sell=70, min_rows=150, zz_pct=0.05, zz_min_bars=5):
+    X_list, y_list, feature_cols = [], [], None
+    for t in stqdm(tickers, desc="Preparing ML data"):
+        hist = load_history_for_ticker(t, period="5y", interval="1wk")
+        if hist is None or len(hist) < min_rows: continue
+        feat = compute_features(hist, sma_windows, support_window, zz_pct, zz_min_bars)
+        y = label_from_rule_based(feat, rsi_buy=rsi_buy, rsi_sell=rsi_sell) if label_mode == "rule" else label_from_future_returns(feat, horizon, buy_thr, sell_thr)
+        data = feat.join(y.rename("Label")).dropna()
+        if data.empty: continue
+        use = data.select_dtypes(include=[np.number]).drop(columns=["Label", "Support", "Bullish_Div", "Bearish_Div"], errors="ignore")
+        if feature_cols is None: feature_cols = list(use.columns)
+        X_list.append(use[feature_cols]); y_list.append(data["Label"])
+    if not X_list: return pd.DataFrame(), pd.Series(dtype=int), [], pd.Series()
+    return pd.concat(X_list), pd.concat(y_list), feature_cols, pd.Series()
+
+##########################################################################
+# MODIFIED: PRIMARY ML FUNCTION NOW USES GRADIENT BOOSTING
+##########################################################################
 def train_gb_classifier(X, y, random_state=42):
     if X.empty or y.empty: return None, None, None
     stratify_opt = y if len(np.unique(y)) > 1 else None
@@ -202,12 +324,11 @@ def train_gb_classifier(X, y, random_state=42):
         split = int(len(X) * 0.8)
         X_train, X_test, y_train, y_test = X.iloc[:split], X.iloc[split:], y.iloc[:split], y.iloc[split:]
 
-    # Updated to Gradient Boosting
+    # Swapped RandomForest for GradientBoosting
     clf = GradientBoostingClassifier(
-        n_estimators=100, 
-        learning_rate=0.05, 
-        max_depth=4, 
-        subsample=0.8,
+        n_estimators=100,
+        learning_rate=0.1,
+        max_depth=3,
         random_state=random_state
     )
     clf.fit(X_train, y_train)
@@ -217,12 +338,11 @@ def train_gb_classifier(X, y, random_state=42):
 
 def compare_ml_models(X, y):
     models = {
-        "GradientBoosting": GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=42),
+        "GradientBoosting": GradientBoostingClassifier(),
         "RandomForest": RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42),
-        "LogisticRegression": LogisticRegression(max_iter=500)
+        "LogisticRegression": LogisticRegression(max_iter=200)
     }
-    if XGB_OK: models["XGBoost"] = XGBClassifier(eval_metric="mlogloss")
-    
+    if XGB_OK: models["XGBoost"] = XGBClassifier(eval_metric="mlogloss", random_state=42)
     results = []
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     for name, model in models.items():
@@ -233,90 +353,78 @@ def compare_ml_models(X, y):
         except: pass
     return pd.DataFrame(results).sort_values("Accuracy", ascending=False)
 
-# ---------------- APP LOGIC HELPERS ----------------
-def get_features_for_all(tickers, sma_windows, support_window, zz_pct, zz_min_bars):
-    multi_df = download_data_multi(tickers)
-    if multi_df is None: return pd.DataFrame()
-    feats_list = []
-    available = multi_df.columns.get_level_values(0).unique()
-    for t in tickers:
-        if t in available:
-            df = compute_features(multi_df[t].dropna(), sma_windows, support_window, zz_pct, zz_min_bars).dropna()
-            if not df.empty:
-                row = df.iloc[-1].to_dict()
-                row["Ticker"] = t
-                feats_list.append(row)
-    return pd.DataFrame(feats_list)
-
-def predict_buy_sell_rule(df, rsi_buy=30, rsi_sell=70):
-    res = df.copy()
-    res["Buy_Point"] = (res["RSI"] < rsi_buy) | (res["Elliott_Bullish_Int"] == 1)
-    res["Sell_Point"] = (res["RSI"] > rsi_sell) | (res["Elliott_Bearish_Int"] == 1)
-    return res
-
-def build_ml_dataset_for_tickers(tickers, sma_windows, support_window, label_mode="rule", rsi_buy=30, rsi_sell=70, zz_pct=0.05, zz_min_bars=5):
-    X_list, y_list = [], []
-    for t in stqdm(tickers, desc="Data Prep"):
-        hist = load_history_for_ticker(t)
-        if len(hist) < 100: continue
-        feat = compute_features(hist, sma_windows, support_window, zz_pct, zz_min_bars).dropna()
-        if feat.empty: continue
-        
-        # Simple labeling
-        y = pd.Series(0, index=feat.index)
-        y[(feat["RSI"] < rsi_buy)] = 1
-        y[(feat["RSI"] > rsi_sell)] = -1
-        
-        data = feat.join(y.rename("Label")).dropna()
-        X_list.append(data.select_dtypes(include=[np.number]).drop(columns=["Label"]))
-        y_list.append(data["Label"])
-    
-    if not X_list: return pd.DataFrame(), pd.Series(), []
-    X = pd.concat(X_list)
-    return X, pd.concat(y_list), X.columns.tolist()
+def latest_feature_row_for_ticker(ticker, sma_windows, support_window, feature_cols, zz_pct, zz_min_bars):
+    hist = load_history_for_ticker(ticker, period="5y", interval="1wk")
+    if hist is None or hist.empty: return None
+    feat = compute_features(hist, sma_windows, support_window, zz_pct, zz_min_bars).dropna()
+    if feat.empty: return None
+    row = feat.select_dtypes(include=[np.number]).iloc[-1:].copy()
+    for m in [c for c in feature_cols if c not in row.columns]: row[m] = 0.0
+    return row[feature_cols]
 
 # ---------------- SIDEBAR ----------------
 with st.sidebar:
     st.header("Settings")
-    selected_tickers = st.multiselect("Stocks", NIFTY500_TICKERS, default=NIFTY500_TICKERS[:10])
-    sma_w1 = st.number_input("SMA 1", 5, 200, 20)
-    sma_w2 = st.number_input("SMA 2", 5, 200, 50)
-    sma_w3 = st.number_input("SMA 3", 5, 200, 200)
-    zz_pct = st.slider("ZigZag %", 1, 15, 5) / 100.0
-    zz_min_bars = st.slider("Min Bars", 1, 10, 5)
-    rsi_buy = st.slider("RSI Buy", 10, 50, 30)
-    rsi_sell = st.slider("RSI Sell", 50, 90, 70)
+    select_all = st.checkbox("Select all stocks", value=True)
+    selected_tickers = st.multiselect("Select stocks", NIFTY500_TICKERS, default=NIFTY500_TICKERS if select_all else NIFTY500_TICKERS[:25])
+    sma_w1 = st.number_input("SMA 1", 5, 250, 20)
+    sma_w2 = st.number_input("SMA 2", 5, 250, 50)
+    sma_w3 = st.number_input("SMA 3", 5, 250, 200)
+    support_window = st.number_input("Support", 5, 200, 30)
+    st.markdown("---")
+    zz_pct = st.slider("ZigZag %", 2, 12, 5) / 100.0
+    zz_min_bars = st.slider("Min Bars", 3, 15, 5)
+    st.markdown("---")
+    label_mode = st.radio("ML Mode", ["Rule-based (teach the rules)", "Future Returns"])
+    if label_mode == "Rule-based (teach the rules)":
+        rsi_buy = st.slider("RSI Buy", 5, 50, 30); rsi_sell = st.slider("RSI Sell", 50, 95, 70)
+        ml_horizon, ml_buy_thr, ml_sell_thr = 8, 0.05, -0.05
+    else:
+        rsi_buy = st.slider("RSI Buy", 5, 50, 30); rsi_sell = st.slider("RSI Sell", 50, 95, 70)
+        ml_horizon = st.number_input("Horizon", 1, 52, 8)
+        ml_buy_thr = st.number_input("Buy Thr", 0.01, 0.5, 0.05)
+        ml_sell_thr = st.number_input("Sell Thr", -0.5, -0.01, -0.05)
     if st.button("Run Weekly Analysis"): st.session_state.analysis_run = True
 
 # ---------------- MAIN ----------------
 if st.session_state.analysis_run:
     sma_tuple = (sma_w1, sma_w2, sma_w3)
-    feats = get_features_for_all(selected_tickers, sma_tuple, 30, zz_pct, zz_min_bars)
-    
-    if not feats.empty:
+    feats = get_features_for_all(selected_tickers, sma_tuple, support_window, zz_pct, zz_min_bars)
+    if feats.empty: st.error("No valid data.")
+    else:
         preds_rule = predict_buy_sell_rule(feats, rsi_buy, rsi_sell)
-        tab1, tab2, tab3 = st.tabs(["✅ Rule Buy", "🤖 ML Signals", "📊 Comparison"])
+        tab1, tab2, tab3, tab4 = st.tabs(["✅ Rule Buy", "❌ Rule Sell", "📈 Chart", "🤖 ML Signals"])
         
         with tab1:
-            st.dataframe(preds_rule[preds_rule["Buy_Point"]][["Ticker", "Close", "RSI"]])
-        
+            df_buy = preds_rule[preds_rule["Buy_Point"]].copy()
+            if not df_buy.empty: st.write(add_tradingview_links(df_buy).to_html(escape=False, index=False), unsafe_allow_html=True)
         with tab2:
-            X, y, cols = build_ml_dataset_for_tickers(selected_tickers, sma_tuple, 30, rsi_buy=rsi_buy, rsi_sell=rsi_sell)
-            clf, acc, rep = train_gb_classifier(X, y)
-            st.success(f"Gradient Boosting Model Accuracy: {acc:.2%}")
-            
-            # Predict latest
-            ml_results = []
-            for t in selected_tickers:
-                hist = load_history_for_ticker(t)
-                f = compute_features(hist, sma_tuple, 30, zz_pct, zz_min_bars).dropna()
-                if not f.empty:
-                    row = f.iloc[-1:][cols]
-                    pred = clf.predict(row)[0]
-                    prob = clf.predict_proba(row)[0]
-                    ml_results.append({"Ticker": t, "ML_Pred": {1:"BUY", 0:"HOLD", -1:"SELL"}[pred], "Confidence": max(prob)})
-            st.dataframe(pd.DataFrame(ml_results))
-
+            df_sell = preds_rule[preds_rule["Sell_Point"]].copy()
+            if not df_sell.empty: st.write(add_tradingview_links(df_sell).to_html(escape=False, index=False), unsafe_allow_html=True)
         with tab3:
-            st.subheader("Model Comparison")
-            st.table(compare_ml_models(X, y))
+            t_chart = st.selectbox("Chart Ticker", selected_tickers)
+            c_df = yf.download(t_chart, period="3y", interval="1wk", progress=False)
+            if not c_df.empty:
+                c_df = compute_features(c_df, sma_tuple, support_window, zz_pct, zz_min_bars).dropna()
+                st.line_chart(c_df[["Close", f"SMA{sma_w1}", f"SMA{sma_w2}", f"SMA{sma_w3}"]])
+        with tab4:
+            X, y, f_cols, _ = build_ml_dataset_for_tickers(selected_tickers, sma_tuple, support_window, label_mode, ml_horizon, ml_buy_thr, ml_sell_thr, rsi_buy, rsi_sell, 150, zz_pct, zz_min_bars)
+            if X.empty: st.warning("Not enough data.")
+            else:
+                clf, acc, report = train_gb_classifier(X, y)
+                st.caption(f"Gradient Boosting Accuracy: **{acc:.3f}**")
+                st.subheader("📊 Model Comparison")
+                st.dataframe(compare_ml_models(X, y), use_container_width=True)
+                
+                rows = []
+                for t in stqdm(selected_tickers, desc="Scoring"):
+                    r = latest_feature_row_for_ticker(t, sma_tuple, support_window, f_cols, zz_pct, zz_min_bars)
+                    if r is not None:
+                        pred = clf.predict(r)[0]; prob = clf.predict_proba(r)[0]
+                        rows.append({"Ticker": t, "ML_Pred": {1:"BUY", 0:"HOLD", -1:"SELL"}[int(pred)], "Confidence": max(prob)})
+                
+                ml_df = pd.DataFrame(rows).merge(feats[["Ticker", "Close"]], on="Ticker")
+                st.dataframe(ml_df, use_container_width=True)
+                st.download_button("📥 Download CSV", ml_df.to_csv(index=False).encode(), "signals.csv", "text/csv")
+        st.markdown("---")
+        st.markdown("⚠ Educational use only — not financial advice.")
